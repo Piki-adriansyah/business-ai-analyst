@@ -1,3 +1,4 @@
+from contextlib import closing
 import io
 import tempfile
 import unittest
@@ -41,7 +42,7 @@ class BusinessAnalystTests(unittest.TestCase):
 
     def test_data_privacy(self):
         import sqlite3
-        with sqlite3.connect(self.db) as conn:
+        with closing(sqlite3.connect(self.db)) as conn, conn:
             columns=[x[1] for x in conn.execute('PRAGMA table_info(sales_rows)')]
         for hidden in ['ktp','npwp','customer','phone','membership','address']:
             self.assertNotIn(hidden,columns)
@@ -84,7 +85,7 @@ class BusinessAnalystTests(unittest.TestCase):
         self.assertEqual(info['rows'],1)
         # Roll back fixture mutation for subsequent tests (order is alphabetical).
         import sqlite3
-        with sqlite3.connect(self.db) as conn:
+        with closing(sqlite3.connect(self.db)) as conn, conn:
             conn.execute("DELETE FROM sales_rows WHERE source_file='another.csv'")
             conn.execute("DELETE FROM imports WHERE filename='another.csv'")
 
@@ -109,7 +110,7 @@ class SecureImportTests(unittest.TestCase):
         try:
             ingest_file(db,io.BytesIO(data),'sensitive.csv')
             import sqlite3
-            with sqlite3.connect(db) as conn:
+            with closing(sqlite3.connect(db)) as conn, conn:
                 fields=[col[1].lower() for col in conn.execute('PRAGMA table_info(sales_rows)')]
                 row_text=str(conn.execute('SELECT * FROM sales_rows LIMIT 1').fetchone())
             for banned in ('salesperson','customer','npwp','phone'):

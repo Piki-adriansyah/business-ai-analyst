@@ -9,6 +9,8 @@ import re
 import urllib.error
 import urllib.request
 from typing import Any
+from datetime import date
+from .advanced import anomaly_days, product_abc, quality_report, enriched_aggregate, previous_period, branch_comparison
 
 from .engine import aggregate, dataset_info, distinct_values, filter_sql, overview, trend
 
@@ -58,7 +60,8 @@ def _scope(question: str, db_path: str, where: str, params: list) -> tuple[str,l
     return where,params,''
 
 
-def answer_question(question: str, db_path: str, where: str, params: list) -> dict[str,Any]:
+def answer_question(question: str, db_path: str, where: str, params: list,
+                    period_context: dict|None=None) -> dict[str,Any]:
     q=' '.join(question.lower().split())
     if not q:
         return {'answer':'Tulis pertanyaan terlebih dahulu.','table':[],'context':{}}
@@ -75,20 +78,128 @@ def answer_question(question: str, db_path: str, where: str, params: list) -> di
     if not o['rows']:
         return {'answer':'Tidak ada transaksi yang cocok dengan filter atau cabang yang disebutkan.','table':[],'context':context}
 
+    # V2: specialized deterministic analyses over whitelisted SQL only.
+    if any(k in q for k in ('abc','pareto','80/20','80 20')):
+        abc=product_abc(db_path,scoped_where,scoped_params,preview_limit=12)
+        classes=abc['classes']
+        table=[{'SKU':r['sku'],'Produk':r['item'],'Kelas':r['abc'],
+                'Omzet':r['sales'],'Kontribusi (%)':round(r['sales_share'] or 0,2)}
+               for r in abc['items']]
+        return {'answer':f"**Analisis ABC seluruh {abc['total_skus']:,} SKU**\n\n"
+                  f"- Kelas A: **{classes['A']:,} SKU** (kontribusi kumulatif awal sekitar 80%)\n"
+                  f"- Kelas B: **{classes['B']:,} SKU** (kontribusi berikutnya hingga ~95%)\n"
+                  f"- Kelas C: **{classes['C']:,} SKU** (sisanya).\n\n"
+                  "Penentuan kelas memakai seluruh SKU dengan omzet positif dan mengacu pada data terfilter. "
+                  "Produk beromzet nol/negatif perlu diperiksa terpisah.",
+                'table':table,'context':{**context,'abc_counts':classes}}
+
+    if any(k in q for k in ('anomali','tidak normal','outlier','lonjakan')):
+        ana=anomaly_days(db_path,scoped_where,scoped_params)
+        if not ana['enough_data']:
+            return {'answer':ana['note'],'table':[],'context':context}
+        top=ana['signals']
+        if not top:
+            msg='Tidak ditemukan sinyal anomali kuat pada omzet harian dalam periode terfilter.'
+        else:
+            msg=f'Ditemukan **{len(top)} tanggal** dengan deviasi tinggi dari median penjualan.'
+        return {'answer':msg+'\n\n'+ana['note'],
+                'table':[{'Tanggal':r['period'],'Omzet':r['sales'],
+                          'Skor robust z':r['robust_z'],'Arah':r['arah']} for r in top],
+                'context':{**context,'anomaly_count':len(top)}}
+
+    if any(k in q for k in ('kualitas data','data kosong','validasi','data bermasalah')):
+        qc=quality_report(db_path,scoped_where,scoped_params)
+        return {'answer':f"**Pemeriksaan kualitas pada {qc['rows']:,} baris**\n\n"
+                f"- SKU kosong: {qc['missing_sku']:,}\n"
+                f"- Kategori kosong: {qc['missing_category']:,}\n"
+                f"- Qty <= 0: {qc['nonpositive_qty']:,}\n"
+                f"- Sales negatif: {qc['negative_sales']:,}\n"
+                f"- Laba kotor negatif: {qc['negative_gross_profit']:,}.\n\n"
+                'Ini indikator untuk ditinjau, bukan bukti kecurangan atau kesalahan sumber.',
+                'table':[],'context':{**context,'quality':qc}}
+
+    if ('margin' in q or 'persentase laba' in q) and any(k in q for k in ('cabang','toko','kategori','produk')):
+        dim = 'store' if any(k in q for k in ('cabang','toko')) else ('category' if 'kategori' in q else 'item')
+        rows=[r for r in enriched_aggregate(db_path,scoped_where,scoped_params,dim,'margin',20)
+              if r['margin'] is not None and r['sales']>0]
+        if rows:
+            return {'answer':f'Peringkat margin laba kotor tertinggi berdasarkan {LABELS[dim]} pada data terfilter. '
+                              'Margin dari omzet kecil perlu dibandingkan dengan nilai dan volume transaksi.',
+                    'table':[{'Nama':r['label'],'Margin (%)':round(r['margin'],2),
+                              'Omzet':r['sales'],'Laba Kotor':r['gross_profit']} for r in rows],
+                    'context':{**context,'margin_ranking':rows[:8]}}
+
+    # Comparison between precisely named branches (not guessed locations).
+    if any(k in q for k in ('bandingkan','versus',' vs ','perbandingan')) and any(k in q for k in ('cabang','toko')):
+        names=distinct_values(db_path,'store')
+        matched=[n for n in names if len(n)>2 and n.casefold() in q.casefold()]
+        if len(matched)==2:
+            rows=[]
+            for n in matched:
+                ww=where+' AND store=?'; pp=[*params,n]
+                data=overview(db_path,ww,pp)
+                rows.append({'Cabang':n,'Omzet':data['sales'],'Laba Kotor':data['gross_profit'],
+                            'Margin (%)':round(data['margin'],2),'Transaksi':data['transactions']})
+            return {'answer':'Perbandingan dua cabang berikut mengikuti filter aktif. '
+                    'Perbedaan angka belum membuktikan penyebab performa.',
+                    'table':rows,'context':{**context,'branch_comparison':rows}}
+
     if any(kw in q for kw in ['margin','persentase laba']):
         return {'answer':f"Margin laba kotor pada data terfilter adalah **{o['margin']:.2f}%**, dari omzet sebelum pajak {idr(o['sales'])} dan laba kotor {idr(o['gross_profit'])}.\n\n**Catatan:** ini margin laba kotor, bukan laba bersih.",
                 'table':[],'context':context}
 
-    if any(kw in q for kw in ['pertumbuhan','growth','dibanding','perbandingan','kenapa turun','mengapa turun','naik atau turun']):
+    if any(kw in q for kw in ['pertumbuhan','growth','dibanding','perbandingan',
+                              'kenapa turun','mengapa turun','naik atau turun']):
+        if period_context:
+            start_date=period_context.get('start')
+            end_date=period_context.get('end')
+            if start_date and end_date:
+                comp=previous_period(db_path,start_date,end_date,
+                       stores=period_context.get('stores'),
+                       categories=period_context.get('categories'),
+                       statuses=period_context.get('statuses'),
+                       brands=period_context.get('brands'),
+                       suppliers=period_context.get('suppliers'))
+                if comp['comparable'] and comp['growth_pct'] is not None:
+                    delta=comp['growth_pct']
+                    suffix='naik' if delta>=0 else 'turun'
+                    result={'answer':f"Omzet pada **{comp['current_start']} s.d. {comp['current_end']}**: "
+                            f"**{idr(comp['current']['sales'])}**. Periode pembanding "
+                            f"**{comp['prior_start']} s.d. {comp['prior_end']}**: "
+                            f"**{idr(comp['previous']['sales'])}**. "
+                            f"Perubahan omzet **{suffix} {abs(delta):.2f}%**.\n\n"
+                            'Ini perubahan deskriptif, bukan bukti mengapa omzet berubah.',
+                            'table':[],'context':{**context,'previous':comp['previous']['sales'],
+                                                  'growth_pct':delta}}
+                    if any(x in q for x in ('kenapa','mengapa','penyebab','faktor')):
+                        c=branch_comparison(db_path,start_date,end_date,
+                             stores=period_context.get('stores'),categories=period_context.get('categories'),
+                             statuses=period_context.get('statuses'),brands=period_context.get('brands'),
+                             suppliers=period_context.get('suppliers'),limit=8)
+                        result['table']=[{'Cabang':r['cabang'],'Omzet sekarang':r['sekarang'],
+                                          'Omzet sebelumnya':r['sebelumnya'],
+                                          'Selisih':r['selisih']} for r in c['rows']]
+                        result['answer'] += '\n\nTabel menunjukkan cabang dengan perubahan absolut terbesar, '
+                        result['answer'] += 'bukan kepastian penyebab perubahan.'
+                    return result
+                if not comp['comparable']:
+                    return {'answer':'**Belum bisa menghitung growth yang sebanding.** '
+                            +comp['why_not']+'\n\nUpload data pada periode sebelumnya secara lengkap.',
+                            'table':[],'context':context}
         if o['days']<2:
-            return {'answer':f"**Belum bisa menghitung pertumbuhan antarhari** karena data yang terfilter hanya mencakup {o['days']} hari ({info['min_date']}). Upload file dari beberapa tanggal agar saya bisa membandingkan periode, menghitung pertumbuhan, dan mengidentifikasi faktor kontribusi.\n\nOmzet yang tersedia: **{idr(o['sales'])}**.",
+            return {'answer':f"**Belum bisa menghitung pertumbuhan antarhari** karena data yang terfilter "
+                    f"hanya mencakup {o['days']} hari. Upload file tanggal sebelumnya sebagai pembanding.",
                     'table':[],'context':context}
         series=trend(db_path,scoped_where,scoped_params)
         first,last=series[0],series[-1]
         growth=None if first['sales']==0 else (last['sales']/first['sales']-1)*100
-        growth_text='tidak dapat dihitung (nilai awal nol)' if growth is None else f'{growth:+.2f}%'
-        return {'answer':f"Pada tanggal awal **{first['period']}**, omzet {idr(first['sales'])}; pada tanggal akhir **{last['period']}**, omzet {idr(last['sales'])}. Perubahan antara kedua tanggal tersebut: **{growth_text}**.\n\nIni perbandingan dua hari ujung periode, belum membuktikan penyebab perubahan.",
-                'table':[{'Tanggal':r['period'],'Omzet':r['sales']} for r in series[-14:]],'context':context}
+        growth_text='tidak bisa dihitung: awal bernilai nol' if growth is None else f'{growth:+.2f}%'
+        return {'answer':f"Perbandingan tanggal pertama ({first['period']}, {idr(first['sales'])}) "
+                f"dan terakhir ({last['period']}, {idr(last['sales'])}): **{growth_text}**. "
+                'Ini BUKAN growth antarperiode dengan panjang sama; pilih rentang yang memiliki periode '
+                'sebelumnya untuk analisis pertumbuhan yang valid.',
+                'table':[{'Tanggal':r['period'],'Omzet':r['sales']} for r in series[-14:]],
+                'context':context}
 
     # Metric selection
     metric='sales'

@@ -8,12 +8,14 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import math
 import re
 import sqlite3
 import tempfile
 import time
 import zipfile
 from collections import Counter
+from contextlib import closing, contextmanager
 from datetime import date, datetime
 from pathlib import Path
 from typing import BinaryIO, Callable, Iterator
@@ -144,7 +146,7 @@ def _iter_xlsx(file: BinaryIO, progress: Callable[[int], None] | None = None) ->
     except zipfile.BadZipFile as exc:
         raise ValueError('File XLSX tidak valid / rusak.') from exc
     with z:
-        if sum(p.file_size for p in z.infolist()) > 1_500_000_000:
+        if len(z.infolist()) > 600 or sum(p.file_size for p in z.infolist()) > 1_500_000_000:
             raise ValueError('XLSX terlalu besar setelah diekstrak; batasi ukuran data.')
         shared = _shared_strings(z)
         sheets = sorted((name for name in z.namelist()
@@ -227,6 +229,21 @@ def number(raw) -> float:
         return 0.
 
 
+def valid_required_number(raw) -> bool:
+    """Do not silently convert malformed mandatory Qty/Sales values into zero."""
+    s=str(raw or '').strip().replace('Rp','').replace(' ','')
+    if not re.fullmatch(r'[+-]?\d[\d.,]*(?:[eE][+-]?\d+)?',s):
+        return False
+    if ',' in s and '.' in s:
+        s=s.replace('.','').replace(',','.') if s.rfind(',')>s.rfind('.') else s.replace(',','')
+    elif ',' in s:
+        s=s.replace(',','') if re.fullmatch(r'-?\d{1,3}(,\d{3})+',s) else s.replace(',','.')
+    try:
+        return math.isfinite(float(s))
+    except ValueError:
+        return False
+
+
 def normalize_date(raw: str) -> str:
     s = str(raw or '').strip()
     if not s:
@@ -267,12 +284,12 @@ def _row_values(source: dict[str,str]) -> list:
 def create_database() -> str:
     f = tempfile.NamedTemporaryFile(prefix='bai_session_',suffix='.sqlite3',delete=False)
     f.close()
-    with sqlite3.connect(f.name) as con:
+    with closing(sqlite3.connect(f.name)) as con, con:
         con.execute('PRAGMA journal_mode=DELETE')
         con.execute('PRAGMA synchronous=OFF')
         cols=', '.join(f'{name} {typ}' for name,typ in FIELD_SQL)
         con.execute(f'CREATE TABLE sales_rows (source_file TEXT NOT NULL, source_row INTEGER NOT NULL, {cols})')
-        con.execute('CREATE TABLE imports (filename TEXT NOT NULL, file_hash CHAR(64) NOT NULL UNIQUE, rows_inserted INTEGER NOT NULL, rows_bad_date INTEGER NOT NULL, imported_at TEXT NOT NULL)')
+        con.execute('CREATE TABLE imports (filename TEXT NOT NULL, file_hash CHAR(64) NOT NULL UNIQUE, rows_inserted INTEGER NOT NULL, rows_bad_date INTEGER NOT NULL, rows_bad_numbers INTEGER NOT NULL DEFAULT 0, imported_at TEXT NOT NULL)')
     return f.name
 
 
@@ -291,14 +308,19 @@ def ingest_file(db_path: str, uploaded_file: BinaryIO, filename: str,
     names = ['source_file','source_row']+[f for f,_ in FIELD_SQL]
     placeholders=','.join('?' for _ in names)
     insert=f"INSERT INTO sales_rows ({','.join(names)}) VALUES ({placeholders})"
-    count, bad = 0, 0
-    with sqlite3.connect(db_path) as con:
+    count, bad, invalid_numbers = 0, 0, 0
+    with closing(sqlite3.connect(db_path)) as con, con:
         if con.execute('SELECT 1 FROM imports WHERE file_hash=?',(file_hash,)).fetchone():
             raise ValueError(f'File {filename} sudah diimpor di dataset ini. File identik tidak boleh dihitung dua kali.')
         con.execute('BEGIN')
         batch=[]
         try:
             for row_number, row in iterator(uploaded_file) if iterator is _iter_csv else iterator(uploaded_file,progress):
+                if count + len(batch) >= 700_000:
+                    raise ValueError('Batas 700.000 baris per file tercapai. Pecah file atau gunakan server yang lebih besar.')
+                if not valid_required_number(row.get('qty')) or not valid_required_number(row.get('sales')):
+                    invalid_numbers+=1
+                    continue
                 values=_row_values(row)
                 if not values[0]:
                     bad+=1
@@ -315,15 +337,15 @@ def ingest_file(db_path: str, uploaded_file: BinaryIO, filename: str,
                 count+=len(batch)
             if count==0:
                 raise ValueError('Tidak ada baris valid setelah parsing file.')
-            con.execute('INSERT INTO imports VALUES(?,?,?,?,?)',(filename,file_hash,count,bad,datetime.now().isoformat(timespec='seconds')))
+            con.execute('INSERT INTO imports VALUES(?,?,?,?,?,?)',(filename,file_hash,count,bad,invalid_numbers,datetime.now().isoformat(timespec='seconds')))
         except Exception:
             con.rollback()
             raise
-    return {'filename':filename,'rows':count,'invalid_dates':bad,'hash_short':file_hash[:12]}
+    return {'filename':filename,'rows':count,'invalid_dates':bad,'invalid_numbers':invalid_numbers,'hash_short':file_hash[:12]}
 
 
 def finalize_database(db_path: str) -> None:
-    with sqlite3.connect(db_path) as con:
+    with closing(sqlite3.connect(db_path)) as con, con:
         con.executescript('''
         CREATE INDEX IF NOT EXISTS idx_date_store ON sales_rows (completed_date,store);
         CREATE INDEX IF NOT EXISTS idx_cat_date ON sales_rows (category,completed_date);
@@ -333,10 +355,14 @@ def finalize_database(db_path: str) -> None:
         ''')
 
 
+@contextmanager
 def _db(db_path: str):
     con=sqlite3.connect(db_path,timeout=15)
     con.row_factory=sqlite3.Row
-    return con
+    try:
+        yield con
+    finally:
+        con.close()
 
 
 def dataset_info(db_path: str) -> dict:
@@ -350,10 +376,12 @@ def dataset_info(db_path: str) -> dict:
 
 
 def filter_sql(start: str, end: str, stores: list[str]|None=None,
-               categories: list[str]|None=None, statuses: list[str]|None=None) -> tuple[str,list]:
+               categories: list[str]|None=None, statuses: list[str]|None=None,
+               brands: list[str]|None=None, suppliers: list[str]|None=None) -> tuple[str,list]:
     sql=['completed_date >= ?','completed_date <= ?']
     params=[start,end]
-    for col,vals in (('store',stores),('category',categories),('status',statuses)):
+    for col,vals in (('store',stores),('category',categories),('status',statuses),
+                     ('brand',brands),('supplier',suppliers)):
         if vals:
             sql.append(f"{col} IN ({','.join(['?']*len(vals))})")
             params.extend(vals)
@@ -361,7 +389,7 @@ def filter_sql(start: str, end: str, stores: list[str]|None=None,
 
 
 def distinct_values(db_path: str, field: str) -> list[str]:
-    if field not in {'store','category','status'}:
+    if field not in {'store','category','status','brand','supplier'}:
         raise ValueError('Field filter tidak diizinkan')
     with _db(db_path) as con:
         return [r[0] for r in con.execute(f"SELECT DISTINCT {field} FROM sales_rows WHERE {field}<>'' ORDER BY {field}")]
